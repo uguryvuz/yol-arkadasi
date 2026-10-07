@@ -100,7 +100,9 @@
     }
 
     // ---------- SESLİ UYARI ----------
-    const SES_MAX = 5;        // bu mesafeden (m) uzaktakileri söyleme
+    const SES_MAX = 3;        // bu mesafeden (m) uzaktakileri söyleme
+    const ARAC_MAX = 5;       // araçlar için daha uzak sınır (daha hızlı yaklaştıkları için)
+    const SES_HIZ = 1.4;      // konuşma hızı: 1,0 normal, 1,4 hızlı, 1,6 çok hızlı
     const TEKRAR_SN = 6;      // aynı uyarıyı en az kaç saniyede bir söyle
     const ARA_SN = 1.5;       // iki konuşma arası en az süre (acil durum hariç)
     const KARARLI_KARE = 2;   // nesne en az kaç ardışık karede görülmeli (titremeyi eler)
@@ -137,16 +139,15 @@
       }
       const u = new SpeechSynthesisUtterance(metin);
       u.lang = 'tr-TR';
+      u.rate = SES_HIZ;
       if (trSes) u.voice = trSes;
       speechSynthesis.speak(u);
       return true;
     }
 
     function mesafeSoz(m) {
-      const tam = Math.floor(m);
-      const buc = (m - tam) >= 0.5;
-      if (tam === 0) return 'yarım metre';
-      return tam + (buc ? ' buçuk' : '') + ' metre';
+      const tam = Math.floor(m);   // aşağı yuvarla: nesneyi olduğundan uzak söylemeyelim
+      return tam < 1 ? 'yarım metre' : tam + ' metre';
     }
 
     function sesliUyari(nesneler) {
@@ -156,7 +157,8 @@
 
       for (const n of nesneler) {
         const sayi = n.yakin ? 0 : n.mesafe;
-        if (sayi === null || sayi > SES_MAX) continue;   // mesafesi bilinmeyeni veya uzağı söyleme
+        const sinir = ARAC.includes(n.sinif) ? ARAC_MAX : SES_MAX;
+        if (sayi === null || sayi > sinir) continue;      // mesafesi bilinmeyeni veya uzağı söyleme
 
         const anahtar = n.sinif + '|' + n.yon;            // örn. "person|önünüzde"
         if (!(anahtar in yeni)) yeni[anahtar] = (gorulme[anahtar] || 0) + 1;
@@ -174,7 +176,7 @@
       gorulme = yeni;
       if (!secilen) return;
 
-      const acil = secilen.yakin || secSayi <= 1.5 || (ARAC.includes(secilen.sinif) && secSayi <= 4);
+      const acil = secilen.yakin || secSayi <= 1.5 || (ARAC.includes(secilen.sinif) && secSayi <= 3);
       if (!acil && simdi - sonKonusma < ARA_SN * 1000) return;
 
       const metin = secilen.yakin
