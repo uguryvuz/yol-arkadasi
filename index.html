@@ -5,36 +5,206 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Yol Arkadaşı - Prototip</title>
   <style>
-    body { margin:0; background:#000; color:#fff; font-family:sans-serif; text-align:center; }
-    video { width:100%; max-height:70vh; object-fit:cover; background:#222; }
-    button { font-size:28px; padding:24px; width:90%; margin:16px 0;
+    body { margin:0; background:#000; color:#fff; font-family:system-ui, sans-serif; }
+    #sahne { position:relative; width:100%; }
+    video { width:100%; display:block; background:#222; }
+    canvas { position:absolute; left:0; top:0; width:100%; height:100%; }
+    #liste { font-size:22px; padding:12px 16px; min-height:110px; text-align:left;
+             line-height:1.45; white-space:pre-line; }
+    button { font-size:28px; padding:24px; width:90%; margin:16px 5%;
              border-radius:16px; border:none; background:#ffd400; color:#000; font-weight:bold; }
-    #durum { font-size:20px; padding:8px; }
+    button:focus-visible { outline:4px solid #fff; }
+    details { text-align:left; padding:8px 16px 28px; font-size:18px; color:#ddd; }
+    input[type=range] { width:100%; margin-top:12px; }
   </style>
 </head>
 <body>
-  <video id="video" autoplay playsinline muted></video>
-  <div id="durum" role="status" aria-live="polite">Kamera kapalı.</div>
-  <button id="baslat" aria-label="Kamerayı başlat">KAMERAYI BAŞLAT</button>
+  <div id="sahne">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="kanvas"></canvas>
+  </div>
+  <div id="liste" aria-live="off">Kamera kapalı.</div>
+  <button id="baslat" aria-label="Başlat">BAŞLAT</button>
+
+  <details>
+    <summary>Ayarlar (test için)</summary>
+    <label for="duzeltme">Mesafe düzeltmesi: <span id="duzeltmeDeger">1,00</span> katı</label>
+    <input type="range" id="duzeltme" min="0.5" max="1.5" step="0.05" value="1">
+  </details>
+
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3"></script>
 
   <script>
-    const video = document.getElementById('video');
-    const durum = document.getElementById('durum');
-    const btn = document.getElementById('baslat');
+    // ---------- AYARLAR ----------
+    // Kameranın uzun kenar boyunca görüş açısı (derece). iPhone 11 ana kamera için kaba değer.
+    const GORUS_ACISI = 63;
+    const MAX_MESAFE = 15;      // bu mesafeden uzağı "uzak" say
+    const ON_ESIK_ACI = 10;     // bu açının içi "önünüzde"
 
+    // Nesnelerin yaklaşık gerçek boyu (metre). Mesafe hesabı buna dayanır.
+    const GERCEK_BOY = {
+      'person':1.7, 'bicycle':1.0, 'car':1.5, 'motorcycle':1.2, 'bus':3.2, 'truck':3.0,
+      'bench':0.85, 'chair':0.9, 'couch':0.85, 'dog':0.5, 'fire hydrant':0.75,
+      'dining table':0.75, 'bottle':0.22
+    };
+
+    const TR = {
+      'person':'insan', 'bicycle':'bisiklet', 'car':'araba', 'motorcycle':'motosiklet',
+      'bus':'otobüs', 'truck':'kamyon', 'traffic light':'trafik ışığı', 'stop sign':'dur tabelası',
+      'fire hydrant':'yangın musluğu', 'parking meter':'park sayacı', 'bench':'bank',
+      'dog':'köpek', 'cat':'kedi', 'chair':'sandalye', 'couch':'koltuk', 'potted plant':'saksı bitkisi',
+      'bed':'yatak', 'dining table':'masa', 'tv':'televizyon', 'laptop':'dizüstü bilgisayar',
+      'cell phone':'telefon', 'bottle':'şişe', 'cup':'bardak', 'backpack':'sırt çantası',
+      'umbrella':'şemsiye', 'handbag':'çanta', 'suitcase':'bavul', 'book':'kitap'
+    };
+
+    // ---------- DEĞİŞKENLER ----------
+    const video = document.getElementById('video');
+    const kanvas = document.getElementById('kanvas');
+    const ctx = kanvas.getContext('2d');
+    const liste = document.getElementById('liste');
+    const btn = document.getElementById('baslat');
+    const kaydirici = document.getElementById('duzeltme');
+    const duzeltmeDeger = document.getElementById('duzeltmeDeger');
+
+    let model = null;
+    let calisiyor = false;
+    let odak = 500;      // odak uzaklığı (piksel), görüntü boyutuna göre hesaplanır
+    let duzeltme = 1;    // mesafe düzeltme çarpanı
+
+    try {
+      const k = parseFloat(localStorage.getItem('duzeltme'));
+      if (k >= 0.5 && k <= 1.5) duzeltme = k;
+    } catch (e) {}
+    kaydirici.value = duzeltme;
+    duzeltmeDeger.textContent = duzeltme.toFixed(2).replace('.', ',');
+
+    kaydirici.addEventListener('input', () => {
+      duzeltme = parseFloat(kaydirici.value);
+      duzeltmeDeger.textContent = duzeltme.toFixed(2).replace('.', ',');
+      try { localStorage.setItem('duzeltme', duzeltme); } catch (e) {}
+    });
+
+    // ---------- BAŞLAT ----------
     btn.addEventListener('click', async () => {
+      btn.disabled = true;
       try {
+        liste.textContent = 'Kamera açılıyor...';
         const akis = await navigator.mediaDevices.getUserMedia({
           video: { facingMode: { ideal: 'environment' }, width: { ideal: 640 }, height: { ideal: 480 } },
           audio: false
         });
         video.srcObject = akis;
-        durum.textContent = 'Kamera açık.';
+        await video.play();
+
+        liste.textContent = 'Yapay zeka modeli yükleniyor, lütfen bekleyin...';
+        model = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
+
         btn.style.display = 'none';
+        calisiyor = true;
+        dongu();
       } catch (hata) {
-        durum.textContent = 'Kamera açılamadı: ' + hata.message;
+        liste.textContent = 'Hata: ' + hata.message;
+        btn.disabled = false;
       }
     });
+
+    // Saniyede yaklaşık 5 kez analiz (pil ve ısınma için)
+    async function dongu() {
+      if (!calisiyor) return;
+      if (video.readyState >= 2) {
+        if (kanvas.width !== video.videoWidth || kanvas.height !== video.videoHeight) {
+          kanvas.width = video.videoWidth;
+          kanvas.height = video.videoHeight;
+          // Odak uzaklığı (piksel) = (uzun kenar / 2) / tan(görüş açısı / 2)
+          odak = (Math.max(kanvas.width, kanvas.height) / 2) /
+                 Math.tan((GORUS_ACISI * Math.PI / 180) / 2);
+        }
+        const sonuclar = await model.detect(video);
+        isle(sonuclar);
+      }
+      setTimeout(dongu, 200);
+    }
+
+    // ---------- YÖN VE MESAFE ----------
+    function analizEt(s) {
+      const [x, y, g, h] = s.bbox;
+      const vw = kanvas.width, vh = kanvas.height;
+
+      // Yön: kutunun yatay merkezinin kamera ekseninden kaç derece saptığı (+ sağ, - sol)
+      const merkez = x + g / 2;
+      const aci = Math.atan((merkez - vw / 2) / odak) * 180 / Math.PI;
+      const yon = aci > ON_ESIK_ACI ? 'sağınızda' : aci < -ON_ESIK_ACI ? 'solunuzda' : 'önünüzde';
+      const saat = ((12 + Math.round(aci / 30) - 1 + 12) % 12) + 1;
+
+      // Mesafe: nesne boyundan (kutu yüksekliği ne kadar küçükse o kadar uzak)
+      let mesafe = null, yakin = false;
+      const boy = GERCEK_BOY[s.class];
+      if (boy) {
+        if (y <= 3 || y + h >= vh - 3) {
+          yakin = true; // nesne kadraja sığmıyor: tahmin güvenilmez, "çok yakın" say
+        } else {
+          mesafe = Math.round(((odak * boy) / h) * duzeltme * 2) / 2; // 0,5 m'ye yuvarla
+        }
+      }
+      return { isim: TR[s.class] || s.class, yon, saat, mesafe, yakin, skor: s.score, bbox: s.bbox };
+    }
+
+    function mesafeYazisi(n) {
+      if (n.yakin) return 'çok yakın';
+      if (n.mesafe === null) return 'mesafe bilinmiyor';
+      if (n.mesafe > MAX_MESAFE) return MAX_MESAFE + '+ m';
+      return '~' + String(n.mesafe).replace('.', ',') + ' m';
+    }
+
+    function siraAnahtari(n) {
+      if (n.yakin) return 0;
+      if (n.mesafe === null) return 999;
+      return n.mesafe;
+    }
+
+    // ---------- ÇİZİM VE LİSTE ----------
+    function isle(sonuclar) {
+      const nesneler = sonuclar.filter(s => s.score >= 0.5).map(analizEt);
+      nesneler.sort((a, b) => siraAnahtari(a) - siraAnahtari(b));
+
+      ctx.clearRect(0, 0, kanvas.width, kanvas.height);
+
+      // "Ön" bölgenin sınırlarını ince çizgilerle göster
+      const yarim = Math.tan(ON_ESIK_ACI * Math.PI / 180) * odak;
+      ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([8, 8]);
+      for (const cx of [kanvas.width / 2 - yarim, kanvas.width / 2 + yarim]) {
+        ctx.beginPath(); ctx.moveTo(cx, 0); ctx.lineTo(cx, kanvas.height); ctx.stroke();
+      }
+      ctx.setLineDash([]);
+
+      ctx.font = 'bold 24px system-ui, sans-serif';
+      ctx.textBaseline = 'top';
+      for (const n of nesneler) {
+        const [x, y, g, h] = n.bbox;
+        const yazi = n.isim + ', ' + mesafeYazisi(n);
+        ctx.lineWidth = 4;
+        ctx.strokeStyle = '#ffd400';
+        ctx.strokeRect(x, y, g, h);
+        const w = ctx.measureText(yazi).width + 10;
+        const ly = Math.max(0, y - 30);
+        ctx.fillStyle = '#ffd400';
+        ctx.fillRect(x, ly, w, 30);
+        ctx.fillStyle = '#000';
+        ctx.fillText(yazi, x + 5, ly + 3);
+      }
+
+      if (!nesneler.length) {
+        liste.textContent = 'Nesne görünmüyor.';
+        return;
+      }
+      liste.textContent = nesneler.slice(0, 4).map(n =>
+        n.isim + ': ' + mesafeYazisi(n) + ', ' + n.yon + ' (saat ' + n.saat + ')'
+      ).join('\n');
+    }
   </script>
 </body>
 </html>
