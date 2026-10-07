@@ -16,6 +16,8 @@
     button:focus-visible { outline:4px solid #fff; }
     details { text-align:left; padding:8px 16px 28px; font-size:18px; color:#ddd; }
     input[type=range] { width:100%; margin-top:12px; }
+    #sonSoz { font-size:18px; color:#ffd400; padding:4px 16px; min-height:26px; text-align:left; }
+    #sesBtn { background:#fff; }
   </style>
 </head>
 <body>
@@ -24,7 +26,9 @@
     <canvas id="kanvas"></canvas>
   </div>
   <div id="liste" aria-live="off">Kamera kapalı.</div>
+  <div id="sonSoz" aria-live="off"></div>
   <button id="baslat" aria-label="Başlat">BAŞLAT</button>
+  <button id="sesBtn" aria-label="Sesi kapat">SES: AÇIK</button>
 
   <details>
     <summary>Ayarlar (test için)</summary>
@@ -86,9 +90,108 @@
       try { localStorage.setItem('duzeltme', duzeltme); } catch (e) {}
     });
 
+    // Bir işlem belirtilen saniyede bitmezse hata verir (sonsuza kadar takılmasın diye)
+    function zamanAsimi(islem, sn, ad) {
+      return Promise.race([
+        islem,
+        new Promise((_, red) => setTimeout(
+          () => red(new Error(ad + ' ' + sn + ' saniyede bitmedi')), sn * 1000))
+      ]);
+    }
+
+    // ---------- SESLİ UYARI ----------
+    const SES_MAX = 5;        // bu mesafeden (m) uzaktakileri söyleme
+    const TEKRAR_SN = 6;      // aynı uyarıyı en az kaç saniyede bir söyle
+    const ARA_SN = 1.5;       // iki konuşma arası en az süre (acil durum hariç)
+    const KARARLI_KARE = 2;   // nesne en az kaç ardışık karede görülmeli (titremeyi eler)
+    // Tehlike ağırlığı: mesafe bu sayıya bölünür, yani araç 6 m'de bile "yakın" sayılır
+    const AGIRLIK = { car:2, bus:2, truck:2, motorcycle:2, bicycle:1.5, person:1.2, dog:1.2 };
+    const ARAC = ['car', 'bus', 'truck', 'motorcycle'];
+
+    const sonSozEl = document.getElementById('sonSoz');
+    const sesBtn = document.getElementById('sesBtn');
+    let sesAcik = true, trSes = null, sonKonusma = 0, gorulme = {};
+    const sonSoylenen = {};
+
+    function sesSec() {
+      if (!('speechSynthesis' in window)) return;
+      const sesler = speechSynthesis.getVoices();
+      trSes = sesler.find(v => v.lang && v.lang.replace('_', '-').toLowerCase().startsWith('tr')) || null;
+    }
+    sesSec();
+    if ('speechSynthesis' in window) speechSynthesis.onvoiceschanged = sesSec;
+
+    sesBtn.addEventListener('click', () => {
+      sesAcik = !sesAcik;
+      sesBtn.textContent = sesAcik ? 'SES: AÇIK' : 'SES: KAPALI';
+      sesBtn.setAttribute('aria-label', sesAcik ? 'Sesi kapat' : 'Sesi aç');
+      if (!sesAcik && 'speechSynthesis' in window) speechSynthesis.cancel();
+    });
+
+    // Metni sesli okur. Konuşma sürerken yeni uyarı ancak "acil" ise öncekini keser.
+    function konus(metin, acil) {
+      if (!sesAcik || !('speechSynthesis' in window)) return false;
+      if (speechSynthesis.speaking) {
+        if (!acil) return false;
+        speechSynthesis.cancel();
+      }
+      const u = new SpeechSynthesisUtterance(metin);
+      u.lang = 'tr-TR';
+      if (trSes) u.voice = trSes;
+      speechSynthesis.speak(u);
+      return true;
+    }
+
+    function mesafeSoz(m) {
+      const tam = Math.floor(m);
+      const buc = (m - tam) >= 0.5;
+      if (tam === 0) return 'yarım metre';
+      return tam + (buc ? ' buçuk' : '') + ' metre';
+    }
+
+    function sesliUyari(nesneler) {
+      const simdi = Date.now();
+      const yeni = {};
+      let secilen = null, secAnahtar = '', secSayi = 0, secEtkin = Infinity;
+
+      for (const n of nesneler) {
+        const sayi = n.yakin ? 0 : n.mesafe;
+        if (sayi === null || sayi > SES_MAX) continue;   // mesafesi bilinmeyeni veya uzağı söyleme
+
+        const anahtar = n.sinif + '|' + n.yon;            // örn. "person|önünüzde"
+        if (!(anahtar in yeni)) yeni[anahtar] = (gorulme[anahtar] || 0) + 1;
+        if (yeni[anahtar] < KARARLI_KARE) continue;       // henüz yeterince kararlı değil
+
+        const son = sonSoylenen[anahtar];
+        const gecen = son ? simdi - son.zaman : Infinity;
+        // Tekrar söyleme: süre dolduysa VEYA nesne en az 1 m yaklaştıysa
+        const yeniden = gecen > TEKRAR_SN * 1000 || (gecen > 2000 && sayi <= son.mesafe - 1);
+        if (!yeniden) continue;
+
+        const etkin = sayi / (AGIRLIK[n.sinif] || 1);
+        if (etkin < secEtkin) { secEtkin = etkin; secilen = n; secAnahtar = anahtar; secSayi = sayi; }
+      }
+      gorulme = yeni;
+      if (!secilen) return;
+
+      const acil = secilen.yakin || secSayi <= 1.5 || (ARAC.includes(secilen.sinif) && secSayi <= 4);
+      if (!acil && simdi - sonKonusma < ARA_SN * 1000) return;
+
+      const metin = secilen.yakin
+        ? 'Dikkat, çok yakın, ' + secilen.yon + ' ' + secilen.isim + ' var.'
+        : mesafeSoz(secSayi) + ' ' + secilen.yon + ' ' + secilen.isim + ' var.';
+
+      if (konus(metin, acil)) {
+        sonSoylenen[secAnahtar] = { zaman: simdi, mesafe: secSayi };
+        sonKonusma = simdi;
+        sonSozEl.textContent = 'Son söylenen: ' + metin;
+      }
+    }
+
     // ---------- BAŞLAT ----------
     btn.addEventListener('click', async () => {
       btn.disabled = true;
+      konus('Başlatılıyor.', true);   // iPhone sesi ancak dokunuş sırasında açar, o yüzden en başta
       try {
         liste.textContent = 'Kamera açılıyor...';
         const akis = await navigator.mediaDevices.getUserMedia({
@@ -98,11 +201,28 @@
         video.srcObject = akis;
         await video.play();
 
-        liste.textContent = 'Yapay zeka modeli yükleniyor, lütfen bekleyin...';
-        model = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
+        const t0 = Date.now();
+        let adim = 'Adım 1/3: Yapay zeka motoru hazırlanıyor';
+        const sayac = setInterval(() => {
+          liste.textContent = adim + ' (' + Math.round((Date.now() - t0) / 1000) + ' sn)';
+        }, 500);
+        try {
+          await zamanAsimi(tf.ready(), 20, 'Motor hazırlığı');
+          adim = 'Adım 2/3: Motor: ' + tf.getBackend() + '. Model indiriliyor';
+          model = await zamanAsimi(cocoSsd.load({ base: 'lite_mobilenet_v2' }), 60, 'Model indirme');
+        } catch (e1) {
+          if (tf.getBackend() === 'cpu') throw e1;
+          adim = 'Adım 3/3: Yedek motorla (cpu) tekrar deneniyor. İlk hata: ' + e1.message;
+          await tf.setBackend('cpu');
+          await tf.ready();
+          model = await zamanAsimi(cocoSsd.load({ base: 'lite_mobilenet_v2' }), 90, 'Model indirme (cpu)');
+        } finally {
+          clearInterval(sayac);
+        }
 
         btn.style.display = 'none';
         calisiyor = true;
+        konus('Yol arkadaşı hazır. Bu sistem bastonun yerini tutmaz.', true);
         dongu();
       } catch (hata) {
         liste.textContent = 'Hata: ' + hata.message;
@@ -148,7 +268,7 @@
           mesafe = Math.round(((odak * boy) / h) * duzeltme * 2) / 2; // 0,5 m'ye yuvarla
         }
       }
-      return { isim: TR[s.class] || s.class, yon, saat, mesafe, yakin, skor: s.score, bbox: s.bbox };
+      return { sinif: s.class, isim: TR[s.class] || s.class, yon, saat, mesafe, yakin, skor: s.score, bbox: s.bbox };
     }
 
     function mesafeYazisi(n) {
@@ -168,6 +288,7 @@
     function isle(sonuclar) {
       const nesneler = sonuclar.filter(s => s.score >= 0.5).map(analizEt);
       nesneler.sort((a, b) => siraAnahtari(a) - siraAnahtari(b));
+      sesliUyari(nesneler);
 
       ctx.clearRect(0, 0, kanvas.width, kanvas.height);
 
